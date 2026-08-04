@@ -1,0 +1,342 @@
+###############################################################################
+# Viral contig identification, CheckV filtering, and vOTU clustering workflow
+#
+# This script documents the workflow used to identify viral contigs from
+# metagenomic assemblies and cluster them into viral operational taxonomic units
+# (vOTUs). The workflow combines VirSorter2, DeepVirFinder, VIBRANT, and CheckV,
+# followed by all-vs-all BLASTn comparison and ANI-based clustering.
+#
+# NOTE:
+# - Replace all "path/to/..." placeholders with real project paths.
+# - Commands are written for one representative assembly.
+# - For multiple samples, repeat this workflow for each assembly or apply it to
+#   a pooled non-redundant contig set, depending on the study design.
+# - Line-continuation backslashes should not contain trailing spaces.
+###############################################################################
+
+
+###############################################################################
+### 1. Quality control of raw metagenomic reads
+###############################################################################
+
+# Activate the fastp environment.
+# fastp performs quality filtering and adapter trimming for paired-end reads.
+conda activate fastp
+
+# Quality-control raw paired-end reads.
+# -i: input forward raw reads
+# -I: input reverse raw reads
+# -o: output forward clean reads
+# -O: output reverse clean reads
+fastp \
+  -i path/to/Rawreads_1.fq.gz \
+  -I path/to/Rawreads_2.fq.gz \
+  -o path/to/CleanReads_1.fq \
+  -O path/to/CleanReads_2.fq
+
+
+###############################################################################
+### 2. Metagenomic assembly
+###############################################################################
+
+# Activate the MEGAHIT environment.
+# MEGAHIT is used for de novo assembly of metagenomic reads.
+conda activate megahit
+
+# Assemble clean paired-end reads into contigs.
+# -1/-2: quality-controlled paired-end reads
+# -o: output directory for assembly results
+# --min-contig-len 1500: retain contigs >= 1,500 bp in the assembly output
+# --kmin/--kmax: k-mer range used during assembly
+# -t: number of CPU threads
+megahit \
+  -1 path/to/CleanReads_1.fq \
+  -2 path/to/CleanReads_2.fq \
+  -o path/to/Assembly \
+  --min-contig-len 1500 \
+  --kmin 21 \
+  --kmax 141 \
+  -t 40
+
+
+###############################################################################
+### 3. Retain contigs >= 5 kbp for viral identification
+###############################################################################
+
+# Viral contig identification is usually more reliable for longer contigs.
+# Here, contigs shorter than 5 kbp are removed before viral prediction.
+#
+# --remove-gaps: remove gap characters from sequences
+# -m 5000: retain sequences with length >= 5000 bp
+# input: assembled contigs
+# output: contigs_5000.fa, the length-filtered contig set
+seqkit seq \
+  --remove-gaps \
+  -m 5000 \
+  path/to/contigs.fasta \
+  > path/to/contigs_5000.fa
+
+
+###############################################################################
+### 4. Viral contig prediction using VirSorter2
+###############################################################################
+
+# VirSorter2 detects viral sequences using a multi-classifier framework.
+# It can identify diverse DNA and RNA viral groups from metagenomic contigs.
+#
+# -w: output directory
+# -i: input contigs >= 5 kbp
+# --keep-original-seq: keep the original input sequences in the output
+# -j: number of CPU threads
+# all: run all viral group classifiers
+virsorter run \
+  -w path/to/VS_result \
+  -i path/to/contigs_5000.fa \
+  --keep-original-seq \
+  -j 40 \
+  all
+
+
+###############################################################################
+### 5. Viral contig prediction using DeepVirFinder
+###############################################################################
+
+# DeepVirFinder predicts viral contigs using a deep learning model based on
+# sequence composition.
+#
+# -i: input contigs >= 5 kbp
+# -o: output directory
+# -l 5000: minimum sequence length used for prediction
+python dvf.py \
+  -i path/to/contigs_5000.fa \
+  -o path/to/DVF_result \
+  -l 5000
+
+
+###############################################################################
+### 6. Viral contig prediction using VIBRANT
+###############################################################################
+
+# VIBRANT identifies and annotates viral contigs by combining protein prediction,
+# database searches, and machine-learning-based classification. It can also
+# provide lifestyle and auxiliary metabolic gene annotations.
+#
+# -i: input contigs >= 5 kbp
+# -t: number of CPU threads
+python VIBRANT_run.py \
+  -i path/to/contigs_5000.fa \
+  -t 40
+
+
+###############################################################################
+### 7. Integrate viral contig predictions from three strategies
+###############################################################################
+
+# Viral contigs are retained using three complementary criteria.
+#
+# Method 1:
+#   Contigs predicted by VirSorter2 with score >= 0.7 and at least one viral
+#   hallmark gene.
+#
+# Method 2:
+#   Contigs simultaneously predicted by all three tools:
+#   - VirSorter2 score >= 0.5
+#   - DeepVirFinder score >= 0.7 and p <= 0.05
+#   - VIBRANT positive prediction
+#
+# Method 3:
+#   Contigs predicted by any two of the three tools above, followed by CheckV
+#   screening to retain contigs containing at least one viral hallmark gene.
+#
+# The contig IDs satisfying each criterion should be saved as ID lists, for
+# example:
+#   Method1-ID.txt
+#   Method2-ID.txt
+#   Method3-non-checkv-ID.txt
+
+
+###############################################################################
+### 8. Extract contigs by ID list
+###############################################################################
+
+# The following Python script extracts FASTA sequences whose IDs are listed in
+# Method-ID.txt. It can be reused for Method 1, Method 2, and Method 3 by
+# changing the input ID file name, input FASTA file, and output FASTA file.
+#
+# Example expected files:
+# - Method-ID.txt: one contig ID per line
+# - contigs_5000.fa: length-filtered input contigs
+# - Method.fa: extracted contigs
+
+### extract.py
+from Bio import SeqIO
+
+# Open the output FASTA file.
+result = open('Method.fa', 'w')
+
+# Read target contig IDs.
+target_ids = {}
+with open('Method-ID.txt', 'r') as f:
+    for line in f:
+        target_ids[line.strip()] = 1
+
+# Extract target sequences from the length-filtered contig FASTA file.
+for seq_record in SeqIO.parse('contigs_5000.fa', 'fasta'):
+    if str(seq_record.id) in target_ids:
+        result.write('>' + str(seq_record.description) + '\n')
+        result.write(str(seq_record.seq) + '\n')
+
+result.close()
+print('ok')
+
+
+###############################################################################
+### 9. Generate Method1.fa, Method2.fa, and Method3 candidate contigs
+###############################################################################
+
+# Run the extraction script after preparing the corresponding ID list.
+# Repeat this step for each method by changing Method-ID.txt and Method.fa.
+#
+# Expected outputs:
+# - Method1.fa
+# - Method2.fa
+# - Method3-non-checkv.fa
+python extract.py
+
+
+###############################################################################
+### 10. CheckV filtering for Method 3 contigs
+###############################################################################
+
+# CheckV is used to evaluate viral contigs and identify viral hallmark genes.
+# For Method 3, only contigs containing at least one viral hallmark gene are
+# retained after CheckV screening.
+#
+# end_to_end: run the complete CheckV pipeline
+# Method3-non-checkv.fa: candidate viral contigs before CheckV filtering
+# checkv-viral: output directory
+# -t: number of CPU threads
+checkv end_to_end \
+  Method3-non-checkv.fa \
+  checkv-viral \
+  -t 40
+
+# After reviewing the CheckV output, prepare an ID list for Method 3 contigs
+# with at least one viral hallmark gene and rerun extract.py to generate:
+#   Method3.fa
+python extract.py
+
+
+###############################################################################
+### 11. Combine viral contigs from all three identification strategies
+###############################################################################
+
+# Concatenate viral contigs retained by the three methods.
+# The combined FASTA is used for final CheckV processing and vOTU clustering.
+cat Method1.fa Method2.fa Method3.fa > ALL.fa
+
+
+###############################################################################
+### 12. Remove proviral regions and generate cleaned viral contigs
+###############################################################################
+
+# Run CheckV on the integrated viral contig set.
+# CheckV can identify host contamination and trim proviral regions where needed.
+# The cleaned viral contig set should be exported as ALL_clean.fa for clustering.
+checkv end_to_end \
+  ALL.fa \
+  checkv-viral \
+  -t 40
+
+# Expected downstream input:
+#   ALL_clean.fa
+
+
+###############################################################################
+### 13. Build a nucleotide BLAST database for viral contigs
+###############################################################################
+
+# Create a local BLAST database from cleaned viral contigs.
+# This database is used for all-vs-all nucleotide comparison.
+#
+# -in: cleaned viral contig FASTA file
+# -dbtype nucl: nucleotide database
+# -out: BLAST database prefix
+makeblastdb \
+  -in path/to/ALL_clean.fa \
+  -dbtype nucl \
+  -out virusesdb
+
+
+###############################################################################
+### 14. All-vs-all BLASTn comparison
+###############################################################################
+
+# Compare each viral contig against all cleaned viral contigs.
+# The output is used to calculate pairwise ANI values.
+#
+# -query: viral contig FASTA file
+# -db: local BLAST database
+# -outfmt '6 std qlen slen': tabular output with query and subject lengths
+# -max_target_seqs 10000: maximum hits retained per query
+# -out: BLAST output table
+# -num_threads: number of CPU threads
+blastn \
+  -query ALL_clean.fa \
+  -db virusesdb \
+  -outfmt '6 std qlen slen' \
+  -max_target_seqs 10000 \
+  -out blast.tsv \
+  -num_threads 32
+
+
+###############################################################################
+### 15. Calculate ANI values from BLAST results
+###############################################################################
+
+# anicalc.py calculates average nucleotide identity values from BLASTn output.
+# This script is commonly distributed with CheckV helper scripts.
+#
+# -i: all-vs-all BLASTn result
+# -o: pairwise ANI output table
+python anicalc.py \
+  -i blast.tsv \
+  -o ani.tsv
+
+
+###############################################################################
+### 16. Cluster viral contigs into vOTUs
+###############################################################################
+
+# aniclust.py clusters viral contigs into vOTUs based on ANI and coverage.
+# The commonly used species-level viral clustering threshold is 95% ANI across
+# a substantial aligned region.
+#
+# --fna: cleaned viral contig FASTA file
+# --ani: pairwise ANI table
+# --out: output cluster assignment table
+# --min_ani 95: minimum ANI threshold for vOTU clustering
+# --min_tcov 85: minimum target coverage threshold
+# --min_qcov 0: no minimum query coverage threshold
+python aniclust.py \
+  --fna ALL_clean.fa \
+  --ani ani.tsv \
+  --out clusters.tsv \
+  --min_ani 95 \
+  --min_tcov 85 \
+  --min_qcov 0
+
+
+###############################################################################
+### 17. Extract representative sequences for each vOTU
+###############################################################################
+
+# Use clusters.tsv to select one representative sequence per vOTU cluster.
+# The representative is typically the longest contig or the highest-quality
+# contig based on CheckV quality metrics.
+#
+# Expected output:
+#   vOTUs.fa
+python extract.py
+
+
